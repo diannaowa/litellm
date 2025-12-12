@@ -305,3 +305,300 @@ class TestPromptVersionsEndpoint:
             assert exc_info.value.status_code == 404
             assert "No versions found" in exc_info.value.detail
 
+
+class TestPromptDeleteAndUpdate:
+    """
+    Test prompt delete and update operations using primary key (id)
+    """
+
+    @pytest.mark.asyncio
+    async def test_delete_prompt_uses_primary_key(self):
+        """
+        Test that delete_prompt uses the record's primary key (id) instead of prompt_id
+        This fixes the Prisma FieldNotFoundError issue
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from fastapi import HTTPException
+
+        from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+        from litellm.proxy.prompts.prompt_endpoints import delete_prompt
+
+        # Mock user with admin role
+        mock_user = UserAPIKeyAuth(
+            api_key="test_key",
+            user_role=LitellmUserRoles.PROXY_ADMIN
+        )
+
+        # Create mock prompt in registry
+        mock_prompt = PromptSpec(
+            prompt_id="test_prompt.v2",
+            litellm_params=PromptLiteLLMParams(
+                prompt_id="test_prompt",
+                prompt_integration="dotprompt",
+                dotprompt_content="test content"
+            ),
+            prompt_info=PromptInfo(prompt_type="db"),
+        )
+
+        # Mock Prisma client with database record
+        mock_prisma_client = MagicMock()
+        mock_prompt_table = MagicMock()
+        
+        # Mock database record with primary key id
+        mock_db_record = MagicMock()
+        mock_db_record.id = "db-record-uuid-12345"
+        mock_db_record.prompt_id = "test_prompt"
+        mock_db_record.version = 2
+        
+        # Mock find_first to return the record
+        mock_prompt_table.find_first = AsyncMock(return_value=mock_db_record)
+        # Mock delete to verify it's called with id (primary key)
+        mock_prompt_table.delete = AsyncMock(return_value=None)
+        
+        mock_prisma_client.db.litellm_prompttable = mock_prompt_table
+
+        # Mock prompt registry
+        mock_registry = MagicMock()
+        mock_registry.IN_MEMORY_PROMPTS = {"test_prompt.v2": mock_prompt}
+        mock_registry.prompt_id_to_custom_prompt = {}
+        mock_registry.get_prompt_by_id = MagicMock(return_value=mock_prompt)
+
+        with patch("litellm.proxy.proxy_server.prisma_client", mock_prisma_client), \
+             patch("litellm.proxy.prompts.prompt_registry.IN_MEMORY_PROMPT_REGISTRY", mock_registry):
+
+            # Call delete_prompt
+            result = await delete_prompt(
+                prompt_id="test_prompt.v2",
+                user_api_key_dict=mock_user
+            )
+
+            # Verify find_first was called with prompt_id + version (composite key)
+            mock_prompt_table.find_first.assert_called_once()
+            call_args = mock_prompt_table.find_first.call_args
+            assert call_args[1]["where"]["prompt_id"] == "test_prompt"
+            assert call_args[1]["where"]["version"] == 2
+
+            # Verify delete was called with id (primary key), not prompt_id
+            mock_prompt_table.delete.assert_called_once()
+            delete_call_args = mock_prompt_table.delete.call_args
+            assert delete_call_args[1]["where"]["id"] == "db-record-uuid-12345"
+            assert "prompt_id" not in delete_call_args[1]["where"]
+
+            # Verify prompt was removed from memory
+            assert "test_prompt.v2" not in mock_registry.IN_MEMORY_PROMPTS
+
+            # Verify success message
+            assert result["message"] == "Prompt test_prompt.v2 deleted successfully"
+
+    @pytest.mark.asyncio
+    async def test_delete_prompt_not_found_in_database(self):
+        """
+        Test that delete_prompt raises 404 when prompt record is not found in database
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from fastapi import HTTPException
+
+        from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+        from litellm.proxy.prompts.prompt_endpoints import delete_prompt
+
+        mock_user = UserAPIKeyAuth(
+            api_key="test_key",
+            user_role=LitellmUserRoles.PROXY_ADMIN
+        )
+
+        mock_prompt = PromptSpec(
+            prompt_id="test_prompt.v1",
+            litellm_params=PromptLiteLLMParams(
+                prompt_id="test_prompt",
+                prompt_integration="dotprompt",
+            ),
+            prompt_info=PromptInfo(prompt_type="db"),
+        )
+
+        # Mock Prisma client - find_first returns None (not found)
+        mock_prisma_client = MagicMock()
+        mock_prompt_table = MagicMock()
+        mock_prompt_table.find_first = AsyncMock(return_value=None)
+        mock_prisma_client.db.litellm_prompttable = mock_prompt_table
+
+        mock_registry = MagicMock()
+        mock_registry.IN_MEMORY_PROMPTS = {"test_prompt.v1": mock_prompt}
+        mock_registry.get_prompt_by_id = MagicMock(return_value=mock_prompt)
+
+        with patch("litellm.proxy.proxy_server.prisma_client", mock_prisma_client), \
+             patch("litellm.proxy.prompts.prompt_registry.IN_MEMORY_PROMPT_REGISTRY", mock_registry):
+
+            with pytest.raises(HTTPException) as exc_info:
+                await delete_prompt(  # type: ignore[misc]
+                    prompt_id="test_prompt.v1",
+                    user_api_key_dict=mock_user
+                )
+
+            assert exc_info.value.status_code == 404
+            assert "not found in database" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_patch_prompt_uses_primary_key(self):
+        """
+        Test that patch_prompt uses the record's primary key (id) instead of prompt_id
+        This fixes the Prisma FieldNotFoundError issue
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import json
+
+        from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+        from litellm.proxy.prompts.prompt_endpoints import PatchPromptRequest, patch_prompt
+
+        mock_user = UserAPIKeyAuth(
+            api_key="test_key",
+            user_role=LitellmUserRoles.PROXY_ADMIN
+        )
+
+        # Create existing prompt
+        existing_prompt = PromptSpec(
+            prompt_id="test_prompt.v1",
+            litellm_params=PromptLiteLLMParams(
+                prompt_id="test_prompt",
+                prompt_integration="dotprompt",
+                dotprompt_content="original content"
+            ),
+            prompt_info=PromptInfo(prompt_type="db"),
+        )
+
+        # Mock Prisma client
+        mock_prisma_client = MagicMock()
+        mock_prompt_table = MagicMock()
+        
+        # Mock database record
+        mock_db_record = MagicMock()
+        mock_db_record.id = "db-record-uuid-67890"
+        mock_db_record.prompt_id = "test_prompt"
+        mock_db_record.version = 1
+        
+        # Mock updated record
+        updated_db_record = MagicMock()
+        updated_db_record.id = "db-record-uuid-67890"
+        updated_db_record.prompt_id = "test_prompt"
+        updated_db_record.version = 1
+        updated_db_record.litellm_params = json.dumps({
+            "prompt_id": "test_prompt",
+            "prompt_integration": "dotprompt",
+            "dotprompt_content": "updated content"
+        })
+        updated_db_record.prompt_info = json.dumps({"prompt_type": "db"})
+        updated_db_record.model_dump = MagicMock(return_value={
+            "prompt_id": "test_prompt",
+            "version": 1,
+            "litellm_params": {
+                "prompt_id": "test_prompt",
+                "prompt_integration": "dotprompt",
+                "dotprompt_content": "updated content"
+            },
+            "prompt_info": {"prompt_type": "db"}
+        })
+        
+        mock_prompt_table.find_first = AsyncMock(return_value=mock_db_record)
+        mock_prompt_table.update = AsyncMock(return_value=updated_db_record)
+        
+        mock_prisma_client.db.litellm_prompttable = mock_prompt_table
+
+        # Mock prompt registry
+        mock_registry = MagicMock()
+        mock_registry.IN_MEMORY_PROMPTS = {"test_prompt.v1": existing_prompt}
+        mock_registry.prompt_id_to_custom_prompt = {}
+        mock_registry.get_prompt_by_id = MagicMock(return_value=existing_prompt)
+        mock_registry.initialize_prompt = MagicMock(return_value=existing_prompt)
+
+        # Create patch request
+        patch_request = PatchPromptRequest(
+            litellm_params=PromptLiteLLMParams(
+                prompt_id="test_prompt",
+                prompt_integration="dotprompt",
+                dotprompt_content="updated content"
+            ),
+            prompt_info=PromptInfo(prompt_type="db"),
+        )
+
+        with patch("litellm.proxy.proxy_server.prisma_client", mock_prisma_client), \
+             patch("litellm.proxy.prompts.prompt_registry.IN_MEMORY_PROMPT_REGISTRY", mock_registry):
+
+            # Call patch_prompt
+            result = await patch_prompt(
+                prompt_id="test_prompt.v1",
+                request=patch_request,
+                user_api_key_dict=mock_user
+            )
+
+            # Verify find_first was called with prompt_id + version
+            mock_prompt_table.find_first.assert_called_once()
+            call_args = mock_prompt_table.find_first.call_args
+            assert call_args[1]["where"]["prompt_id"] == "test_prompt"
+            assert call_args[1]["where"]["version"] == 1
+
+            # Verify update was called with id (primary key), not prompt_id
+            mock_prompt_table.update.assert_called_once()
+            update_call_args = mock_prompt_table.update.call_args
+            assert update_call_args[1]["where"]["id"] == "db-record-uuid-67890"
+            assert "prompt_id" not in update_call_args[1]["where"]
+
+            # Verify prompt was removed from memory before re-initialization
+            assert "test_prompt.v1" not in mock_registry.IN_MEMORY_PROMPTS
+
+    @pytest.mark.asyncio
+    async def test_patch_prompt_not_found_in_database(self):
+        """
+        Test that patch_prompt raises 404 when prompt record is not found in database
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from fastapi import HTTPException
+
+        from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+        from litellm.proxy.prompts.prompt_endpoints import PatchPromptRequest, patch_prompt
+
+        mock_user = UserAPIKeyAuth(
+            api_key="test_key",
+            user_role=LitellmUserRoles.PROXY_ADMIN
+        )
+
+        existing_prompt = PromptSpec(
+            prompt_id="test_prompt.v1",
+            litellm_params=PromptLiteLLMParams(
+                prompt_id="test_prompt",
+                prompt_integration="dotprompt",
+            ),
+            prompt_info=PromptInfo(prompt_type="db"),
+        )
+
+        # Mock Prisma client - find_first returns None
+        mock_prisma_client = MagicMock()
+        mock_prompt_table = MagicMock()
+        mock_prompt_table.find_first = AsyncMock(return_value=None)
+        mock_prisma_client.db.litellm_prompttable = mock_prompt_table
+
+        mock_registry = MagicMock()
+        mock_registry.IN_MEMORY_PROMPTS = {"test_prompt.v1": existing_prompt}
+        mock_registry.get_prompt_by_id = MagicMock(return_value=existing_prompt)
+
+        patch_request = PatchPromptRequest(
+            litellm_params=PromptLiteLLMParams(
+                prompt_id="test_prompt",
+                prompt_integration="dotprompt",
+            ),
+        )
+
+        with patch("litellm.proxy.proxy_server.prisma_client", mock_prisma_client), \
+             patch("litellm.proxy.prompts.prompt_registry.IN_MEMORY_PROMPT_REGISTRY", mock_registry):
+
+            with pytest.raises(HTTPException) as exc_info:
+                await patch_prompt(  # type: ignore[misc]
+                    prompt_id="test_prompt.v1",
+                    request=patch_request,
+                    user_api_key_dict=mock_user
+                )
+
+            assert exc_info.value.status_code == 404
+            assert "not found in database" in exc_info.value.detail
+
