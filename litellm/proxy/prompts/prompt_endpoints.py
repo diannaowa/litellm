@@ -850,10 +850,20 @@ async def delete_prompt(
                 detail="Cannot delete config prompts.",
             )
 
-        # Delete the prompt from the database
-        await prisma_client.db.litellm_prompttable.delete(
-            where={"prompt_id": prompt_id}
+        # Delete the prompt from the database - locate by base id + version to use the primary key
+        base_prompt_id = get_base_prompt_id(prompt_id=existing_prompt.prompt_id)
+        prompt_version = get_version_number(prompt_id=existing_prompt.prompt_id)
+
+        prompt_record = await prisma_client.db.litellm_prompttable.find_first(
+            where={"prompt_id": base_prompt_id, "version": prompt_version}
         )
+        if prompt_record is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Prompt with ID {prompt_id} not found in database",
+            )
+
+        await prisma_client.db.litellm_prompttable.delete(where={"id": prompt_record.id})
 
         # Remove the prompt from memory
         del IN_MEMORY_PROMPT_REGISTRY.IN_MEMORY_PROMPTS[prompt_id]
@@ -950,9 +960,22 @@ async def patch_prompt(
         if updated_litellm_params is None:
             raise HTTPException(status_code=400, detail="litellm_params cannot be None")
 
+        # Look up the prompt record using the composite key (prompt_id + version)
+        base_prompt_id = get_base_prompt_id(prompt_id=existing_prompt.prompt_id)
+        prompt_version = get_version_number(prompt_id=existing_prompt.prompt_id)
+
+        prompt_record = await prisma_client.db.litellm_prompttable.find_first(
+            where={"prompt_id": base_prompt_id, "version": prompt_version}
+        )
+        if prompt_record is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Prompt with ID {prompt_id} not found in database",
+            )
+
         # Create updated prompt spec - cast to satisfy typing
         updated_prompt_db_entry = await prisma_client.db.litellm_prompttable.update(
-            where={"prompt_id": prompt_id},
+            where={"id": prompt_record.id},
             data={
                 "litellm_params": updated_litellm_params.model_dump_json(),
                 "prompt_info": updated_prompt_info.model_dump_json(),
